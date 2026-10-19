@@ -228,20 +228,9 @@ chrome.runtime.onMessage.addListener(
             break;
           }
           case 'CONTENT_PAGINATE': {
-            const beforeUrl = location.href;
+            // Respond immediately after triggering navigation. Waiting for the next
+            // page here is unreliable because a full navigation destroys this script.
             const result = await goToNextPage();
-            if (result.success) {
-              await waitFor(
-                () =>
-                  location.href !== beforeUrl ||
-                  (detectPagination().currentPage ?? 0) !== (result.pagination.currentPage ?? 0),
-                { timeoutMs: 15000 },
-              );
-              await waitFor(
-                () => document.querySelectorAll('article[data-testid^="job-card-"]').length > 0,
-                { timeoutMs: 15000 },
-              );
-            }
             sendResponse(
               respond({
                 ...result,
@@ -249,6 +238,7 @@ chrome.runtime.onMessage.addListener(
                 pageNumber: detectPagination().currentPage ?? getCurrentPageNumberFromUrl(),
                 jobCount: discoverJobCards().length,
                 challenge: detectChallenge(),
+                triggered: true,
               }),
             );
             break;

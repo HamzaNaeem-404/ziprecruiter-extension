@@ -64,6 +64,75 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function waitForTabComplete(tabId: number, timeoutMs = 20000): Promise<void> {
+  const existing = await chrome.tabs.get(tabId);
+  if (existing.status === 'complete') {
+    // Give SPA routing a moment even when status is already complete
+    await delay(400);
+    return;
+  }
+
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      chrome.tabs.onUpdated.removeListener(listener);
+      reject(new Error('Timed out waiting for the results page to load.'));
+    }, timeoutMs);
+
+    const listener = (
+      updatedTabId: number,
+      changeInfo: chrome.tabs.TabChangeInfo,
+    ) => {
+      if (updatedTabId !== tabId) return;
+      if (changeInfo.status === 'complete') {
+        clearTimeout(timer);
+        chrome.tabs.onUpdated.removeListener(listener);
+        resolve();
+      }
+    };
+
+    chrome.tabs.onUpdated.addListener(listener);
+  });
+
+  await delay(600);
+}
+
+async function discoverJobsWithRetry(
+  tabId: number,
+  attempts = 8,
+): Promise<{
+  jobs: JobCardSummary[];
+  pageNumber: number | null;
+  url: string;
+  challenge?: boolean;
+}> {
+  let lastError: unknown;
+  for (let i = 0; i < attempts; i += 1) {
+    try {
+      await injectContentScript(tabId);
+      const discovered = await sendToTab<{
+        jobs: JobCardSummary[];
+        pageNumber: number | null;
+        url: string;
+        challenge?: boolean;
+        error?: string;
+      }>(tabId, { type: 'CONTENT_DISCOVER_JOBS' });
+
+      if (discovered?.challenge) return discovered;
+      if (discovered?.error) throw new Error(discovered.error);
+      if ((discovered?.jobs?.length ?? 0) > 0) return discovered;
+
+      // Page may still be hydrating — keep trying
+      await delay(500 + i * 250);
+    } catch (error) {
+      lastError = error;
+      await delay(400 + i * 200);
+    }
+  }
+
+  if (lastError) throw lastError;
+  return { jobs: [], pageNumber: null, url: '' };
+}
+
 async function getActiveTab(): Promise<chrome.tabs.Tab | undefined> {
   const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
   return tabs[0];
@@ -420,8 +489,10 @@ async function paginateOrComplete(tabId: number, session: ScrapingSession): Prom
       isFinalPage: boolean;
       currentPage: number | null;
       nextPage: number | null;
+      nextHref: string | null;
     };
     challenge?: boolean;
+    url?: string;
   }>(tabId, { type: 'CONTENT_PAGE_INFO' });
 
   if (pageInfo?.challenge) {
@@ -432,13 +503,16 @@ async function paginateOrComplete(tabId: number, session: ScrapingSession): Prom
     return;
   }
 
-  if (!pageInfo?.pagination?.hasNext) {
+  const pagination = pageInfo?.pagination;
+  if (!pagination?.hasNext) {
     await updateSession((s) => ({
       session: {
         ...s,
         status: 'completed',
         currentJobTitle: null,
         currentJobUrl: null,
+        pendingJobs: [],
+        pendingJobUrls: [],
       },
     }));
     await log(
@@ -450,39 +524,68 @@ async function paginateOrComplete(tabId: number, session: ScrapingSession): Prom
     return;
   }
 
-  const result = await sendToTab<{
-    success: boolean;
-    error?: string;
-    pageNumber?: number | null;
-    jobCount?: number;
-    challenge?: boolean;
-  }>(tabId, { type: 'CONTENT_PAGINATE' });
+  const previousPage = pagination.currentPage ?? session.currentPage;
+  const nextHref = pagination.nextHref;
 
-  if (result?.challenge) {
+  await log(
+    `Moving to page ${pagination.nextPage ?? (previousPage != null ? previousPage + 1 : '?')}…`,
+    'info',
+  );
+
+  // Prefer background-driven navigation so the content script is not required to
+  // survive a full page transition (that was stopping the session on page 2).
+  if (nextHref) {
+    await chrome.tabs.update(tabId, { url: nextHref });
+  } else {
+    // Fallback: ask the content script to click Next, but do not wait on it for load.
+    try {
+      await sendToTab(tabId, { type: 'CONTENT_PAGINATE' });
+    } catch {
+      // Navigation may unload the content script before it can respond — that is OK.
+    }
+  }
+
+  try {
+    await waitForTabComplete(tabId);
+  } catch (error) {
+    // Still attempt discovery; SPA navigations can be flaky with tab status events
+    await log(
+      error instanceof Error ? error.message : 'Page load wait timed out; retrying discovery…',
+      'warn',
+    );
+  }
+
+  await injectContentScript(tabId);
+  await delay(500);
+
+  let discovered: {
+    jobs: JobCardSummary[];
+    pageNumber: number | null;
+    url: string;
+    challenge?: boolean;
+  };
+
+  try {
+    discovered = await discoverJobsWithRetry(tabId);
+  } catch (error) {
+    // Keep the session running so the next tick / tab complete event can recover
+    await log(
+      error instanceof Error
+        ? `Waiting for page 2+ jobs: ${error.message}`
+        : 'Waiting for the next results page to become ready…',
+      'warn',
+    );
+    await broadcastState();
+    return;
+  }
+
+  if (discovered?.challenge) {
     await setSessionStatus('paused', 'Security challenge detected. Resolve it, then resume.');
     await log('Paused for CAPTCHA / security challenge.', 'error');
     await clearTick();
     await broadcastState();
     return;
   }
-
-  if (!result?.success) {
-    await setSessionStatus(
-      'error',
-      result?.error ?? 'Pagination failed. Previously extracted jobs were preserved.',
-    );
-    await log(result?.error ?? 'Pagination failed.', 'error');
-    await clearTick();
-    await broadcastState();
-    return;
-  }
-
-  await delay(800);
-  const discovered = await sendToTab<{
-    jobs: JobCardSummary[];
-    pageNumber: number | null;
-    url: string;
-  }>(tabId, { type: 'CONTENT_DISCOVER_JOBS' });
 
   const state = await getState();
   const nextJobs = (discovered?.jobs ?? []).filter(
@@ -491,12 +594,17 @@ async function paginateOrComplete(tabId: number, session: ScrapingSession): Prom
       !state.session.processedJobIds.includes(j.listingKey || j.jobId),
   );
 
-  // Update search results URL to the new page
+  const resolvedPage =
+    discovered?.pageNumber ??
+    pagination.nextPage ??
+    (previousPage != null ? previousPage + 1 : null);
+
   await updateSession((s) => ({
     session: {
       ...s,
-      searchResultsUrl: discovered?.url || s.searchResultsUrl,
-      currentPage: discovered?.pageNumber ?? result.pageNumber ?? s.currentPage,
+      status: 'running',
+      searchResultsUrl: discovered?.url || nextHref || s.searchResultsUrl,
+      currentPage: resolvedPage,
       pendingJobs: nextJobs,
       pendingJobUrls: nextJobs.map((j) => j.url),
       jobsDiscovered: s.jobsDiscovered + nextJobs.length,
@@ -504,19 +612,22 @@ async function paginateOrComplete(tabId: number, session: ScrapingSession): Prom
         ...s.discoveredJobIds,
         ...nextJobs.map((j) => j.listingKey || j.jobId),
       ].filter((id, idx, arr) => arr.indexOf(id) === idx),
+      lastError: null,
     },
   }));
 
   await log(
-    `Moved to page ${discovered?.pageNumber ?? '?'}. Found ${discovered?.jobs?.length ?? 0} jobs.`,
+    `Moved to page ${resolvedPage ?? '?'}. Found ${discovered?.jobs?.length ?? 0} jobs (${nextJobs.length} new).`,
     'info',
   );
 
   if (nextJobs.length === 0) {
-    // Empty page after pagination — treat as completion
-    await updateSession((s) => ({ session: { ...s, status: 'completed' } }));
-    await log('Reached a page with no new jobs. Session completed.', 'success');
-    await clearTick();
+    // Do not complete immediately — ZipRecruiter may still be rendering, or the
+    // page may only contain duplicates. Let the next tick rediscover / paginate.
+    await log(
+      'No new jobs queued yet after pagination; will retry on the next scrape tick.',
+      'warn',
+    );
   }
 
   await broadcastState();

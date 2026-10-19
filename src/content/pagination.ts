@@ -62,21 +62,19 @@ export function detectPagination(doc: Document = document): PaginationState {
     }
   }
 
-  // Path-style fallback: /jobs-search/{n+1}?...
-  if (!hasNext && currentPage != null && /\/jobs-search/i.test(location.pathname)) {
-    try {
-      const url = new URL(location.href);
-      if (/\/jobs-search\/\d+/i.test(url.pathname)) {
-        url.pathname = url.pathname.replace(/\/jobs-search\/\d+/i, `/jobs-search/${currentPage + 1}`);
-      } else {
-        url.pathname = url.pathname.replace(/\/?$/, '') + `/${currentPage + 1}`;
-        // /jobs-search -> /jobs-search/2
-        url.pathname = url.pathname.replace(/\/jobs-search\/?$/i, `/jobs-search/${currentPage + 1}`);
-      }
-      nextHref = url.toString();
-    } catch {
-      // ignore
+  // If a Next control exists with an href, treat it as available even when
+  // aria-disabled is missing/inconsistent across ZipRecruiter builds.
+  if (!hasNext && nextEl) {
+    const href = absoluteUrl(attrOf(nextEl, 'href'));
+    if (href && !isDisabled(nextEl)) {
+      nextHref = href;
+      hasNext = true;
     }
+  }
+
+  // Path-style fallback: /jobs-search/{n+1}?... when Next is present via numbered links only
+  if (!hasNext && currentPage != null && nextHref) {
+    hasNext = true;
   }
 
   const isFinalPage = !hasNext;
